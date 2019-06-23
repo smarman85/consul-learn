@@ -1,0 +1,118 @@
+Set up:
+  - start the agent:
+    $ consul agent -dev -config-dir=/srv/consul.d
+
+
+Defing a service:
+  - defined by api call
+  - defined by service definition
+
+  Service def:
+    - most common 
+    - https://learn.hashicorp.com/consul/getting-started/services
+    - $ consul agent -dev -config-dir=./consul.d
+      - output "synced" to the web service 
+        means the agent loaded the service def from the conf file
+    - multipele services, you can create multiple service definitions files in the consul
+      config dir.
+
+  Query Services:
+    - once the agent is started the service is synced, we cn query the service using the 
+      dns or HTTP API
+    - dns name is 'NAME.service.consul' by default all DNS names are always in 'consul' namespace
+      although this is configurable
+    - 'service' subdomain tells consul we are querying services and the NAME is the name of the service
+    - $ dig @127.0.0.1 -p 8600 web.service.consul
+        - returns A record based on minimal privs
+    - use DNS api to retrieve entire address/port pair as an srv record
+      $ dig @127.0.0.1 -p 8600 web.service.consul SRV
+      web.service.consul.     0       IN      SRV     1 1 80 2b14fc79ed89.node.dc1.consul.
+      srv record says that the web service is running on port 80 and exists on the node 2b14fc79ed89
+    - with api
+      curl http://localhost:8500/v1/catalog/service/web
+      - the catalog api gives all nodes hosting a given service (health checks later)
+      - only find healthy instances
+      $ curl 'http://localhost:8500/v1/health/service/wed?passing'
+
+  Updating Services:
+    - changing config files and sending a 'SIGUP' to the agent (No downtime)
+    - alternatively, the http api can be used to add, remove, and modify services dynamically
+
+  Connect:
+    - consul provides 'Connect' for automatically connecting via an encrypted TLS connection
+      and authorizing which services are allowed to connect to each other
+    - apps don't need to be modified at all to use Connect. Sidecar proxies can be used to automatically
+      establish TLS connections for inbound and outbound connections
+    - apps can natively integrate with Connect for optimal performance and security
+    - Connect Proxies:
+      - a per-service proxy sidecar transparently handles inbound and outbound service connections
+        automatically wrapping and verifying TLS connections
+    - Connect-unaware service
+      $ socat -v tcp-l:8181,fork exec:"/bin/cat"
+      $ nc 127.0.0.1 8181
+      simple service unaware of Connect 'socat' to start a basic echo service.
+      serivce will accept tcp connections and echo back the data sent
+      'socat' is a decade old unix util 
+      our process is configured to only accept a basic TCP connection. No concept of encryption or tls
+    - register a new service:
+      $ cat <<EOF | sudo tee ./consul.d/socat.json
+      {
+        "service": {
+          "name": "socat",
+          "port": 8181,
+          "connect": { "sidecar_service": {} }
+        }
+      }
+      EOF
+    - only diff is the 'connect' line. This empty configuration notifies consul to register a sidecar
+      proxy for this process
+    - proxy process represents that specific service
+    - accepts inbound connections on a dynamically allocated port, verifies and authorizes the TLS
+      connection and proxies back a standard TCP connection to the process
+    - the above sidecar is telling consul that a proxy shoudl be running. Cosul won't actually run
+      the proxy for you
+      ! need to start another terminal
+      $ consul connect proxy -sidecar-for socat
+
+  - Connecting to the Service:
+    - $ consul connect proxy
+    - this time use the command to configure and run a local proxy that can represent a service
+    - useful tool for dev since it'll let you masquerade as any service (you have permissions for)
+      and establish connections to other services
+    - $ consul connect proxy -service web -upstream socat:9191
+      starts a proxy representing a service "web". with an upstream dep on 'socat'
+      with the above configuration all TCP connections on 9191 will perform service discovery for 
+      conect-capable "socat" endpoint and establish a mutual TLS connection identifying as the
+      service "web"
+    - connection between proxies is now encrypted and authorized
+    - can now talk to 'socat' service via a tls connection
+    - local connections to/from the proxy are unencrypted, but in prod these will be loopback-only
+      connections. Any traffic in/out of the machine is always encrypted
+
+  - Register dependent services:
+    - previous examples were manual
+    - realistically, services will need to establish dependencies over Connect
+    - register a 'web service' that registers 'socat' as upstream dep, in it's sidecard registration
+		$ cat <<EOF | sudo tee ./consul.d/web.json
+		{
+		  "service": {
+		    "name": "web",
+		    "port": 8080,
+		    "connect": {
+		      "sidecar_service": {
+		        "proxy": {
+		          "upstreams": [{
+		             "destination_name": "socat",
+		             "local_bind_port": 9191
+		          }]
+		        }
+		      }
+		    }
+		  }
+		}
+		EOF
+		- this registers a sidecar proxy for the service 'web' that should listen on 9191 to est.
+			connections to "socat" as "web"
+		- the 'web' service should then use that local port to talk to socat rather than directly 
+      attempting to connect
+
